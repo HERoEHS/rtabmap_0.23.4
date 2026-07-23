@@ -156,6 +156,12 @@ public:
 			const std::map<int, Transform> & poses,
 			int floorPerNode = 50,
 			bool dryRun = false);
+	// HERoEHS lifelong: (노드 id → word id 목록)으로 직접 지목한 특징 제거 —
+	// 특징 단위 free-space 증거 경로. 규칙(하한·아카이브·dry-run)은 박스 버전과 동일.
+	std::map<int, int> removeFeaturesByWords(
+			const std::map<int, std::vector<int> > & wordsPerNode,
+			int floorPerNode = 50,
+			bool dryRun = false);
 
 	//getters
 	const std::map<int, double> & getWorkingMem() const {return _workingMem;}
@@ -300,6 +306,14 @@ private:
 
 	//keypoint stuff
 	void disableWordsRef(int signatureId);
+	// HERoEHS lifelong: 특징 제거 공용 헬퍼 — 하한 방어 트리밍 / RAM·사전·DB 반영
+	std::set<int> selectRemovableWords(
+			const Signature & s,
+			const std::map<int, float> & candidates,
+			int floorPerNode) const;
+	void removeWordsFromSignature(
+			Signature * s,
+			const std::set<int> & wordsToRemove);
 	void enableWordsRef(const std::list<int> & signatureIds);
 	void cleanUnusedWords();
 	int getNi(int signatureId) const;

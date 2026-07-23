@@ -6599,6 +6599,20 @@ std::map<int, int> Rtabmap::removeFeaturesInBox(
 	return _memory->removeFeaturesInBox(boxMin, boxMax, _optimizedPoses, floorPerNode, dryRun);
 }
 
+std::map<int, int> Rtabmap::removeFeaturesByWords(
+		const std::map<int, std::vector<int> > & wordsPerNode,
+		int floorPerNode,
+		bool dryRun)
+{
+	std::map<int, int> result;
+	if(_memory == 0)
+	{
+		UERROR("Memory is not initialized, cannot remove features!");
+		return result;
+	}
+	return _memory->removeFeaturesByWords(wordsPerNode, floorPerNode, dryRun);
+}
+
 void Rtabmap::clearPath(int status)
 {
 	UINFO("status=%d", status);

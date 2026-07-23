@@ -149,6 +149,11 @@ public:
 			const cv::Point3f & boxMax,
 			int floorPerNode = 50,
 			bool dryRun = false);
+	// HERoEHS lifelong: (노드 → word 목록) 직접 지목 제거 — free-space 증거 경로
+	std::map<int, int> removeFeaturesByWords(
+			const std::map<int, std::vector<int> > & wordsPerNode,
+			int floorPerNode = 50,
+			bool dryRun = false);
 	Transform getPose(int locationId) const;
 	Transform getMapCorrection() const {return _mapCorrection;}
 	const Memory * getMemory() const {return _memory;}

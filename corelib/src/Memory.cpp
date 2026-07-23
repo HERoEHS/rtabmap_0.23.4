@@ -6672,35 +6672,11 @@ std::map<int, int> Memory::removeFeaturesInBox(
 		{
 			continue;
 		}
-		// 특징 고갈 방어: 노드에 floorPerNode개 유니크 단어는 남긴다 (초과분만, 응답 낮은 순 제거)
-		int uniqueWords = (int)uUniqueKeys(words).size();
-		int allowed = uniqueWords - floorPerNode;
-		if(allowed <= 0)
+		// 특징 고갈 방어 + 응답 낮은 순 트리밍 (공용 헬퍼)
+		std::set<int> wordsToRemove = this->selectRemovableWords(*s, candidates, floorPerNode);
+		if(wordsToRemove.empty())
 		{
-			UWARN("Node %d has only %d unique words (floor=%d), %d candidates kept.",
-					s->id(), uniqueWords, floorPerNode, (int)candidates.size());
 			continue;
-		}
-		std::set<int> wordsToRemove;
-		if((int)candidates.size() <= allowed)
-		{
-			for(std::map<int, float>::iterator cter=candidates.begin(); cter!=candidates.end(); ++cter)
-			{
-				wordsToRemove.insert(cter->first);
-			}
-		}
-		else
-		{
-			std::multimap<float, int> byResponse; // 응답 오름차순 — 약한 특징부터 제거
-			for(std::map<int, float>::iterator cter=candidates.begin(); cter!=candidates.end(); ++cter)
-			{
-				byResponse.insert(std::make_pair(cter->second, cter->first));
-			}
-			for(std::multimap<float, int>::iterator bter=byResponse.begin();
-				bter!=byResponse.end() && (int)wordsToRemove.size() < allowed; ++bter)
-			{
-				wordsToRemove.insert(bter->second);
-			}
 		}
 		removedPerNode.insert(std::make_pair(s->id(), (int)wordsToRemove.size()));
 		totalRemoved += (int)wordsToRemove.size();
@@ -6708,43 +6684,7 @@ std::map<int, int> Memory::removeFeaturesInBox(
 		{
 			continue;
 		}
-		// RAM 재구성: 생존 인스턴스만으로 배열 재구축 (키포인트 인덱스 재부여)
-		bool wasEnabled = s->isEnabled();
-		if(wasEnabled)
-		{
-			this->disableWordsRef(s->id()); // 사전 참조 해제 — 아래 enableWordsRef로 생존분 재등록
-		}
-		std::multimap<int, int> newWords;
-		std::vector<cv::KeyPoint> newKpts;
-		std::vector<cv::Point3f> newWords3;
-		cv::Mat newDescriptors;
-		for(std::multimap<int, int>::const_iterator jter=words.begin(); jter!=words.end(); ++jter)
-		{
-			if(wordsToRemove.find(jter->first) != wordsToRemove.end())
-			{
-				continue;
-			}
-			newWords.insert(std::make_pair(jter->first, (int)newKpts.size()));
-			newKpts.push_back(kpts[jter->second]);
-			newWords3.push_back(words3[jter->second]);
-			if(!descriptors.empty())
-			{
-				newDescriptors.push_back(descriptors.row(jter->second));
-			}
-		}
-		s->setWords(newWords, newKpts, newWords3, newDescriptors);
-		if(wasEnabled)
-		{
-			std::list<int> ids;
-			ids.push_back(s->id());
-			this->enableWordsRef(ids);
-		}
-		s->setModified(true);
-		if(_dbDriver)
-		{
-			_dbDriver->removeFeatures(s->id(), std::vector<int>(wordsToRemove.begin(), wordsToRemove.end()));
-		}
-		_memoryChanged = true;
+		this->removeWordsFromSignature(s, wordsToRemove);
 	}
 	if(!dryRun && totalRemoved > 0 && _vwd->isIncremental())
 	{
@@ -6754,6 +6694,169 @@ std::map<int, int> Memory::removeFeaturesInBox(
 			boxMin.x, boxMin.y, boxMin.z, boxMax.x, boxMax.y, boxMax.z,
 			(int)removedPerNode.size(), totalRemoved, dryRun?1:0);
 	return removedPerNode;
+}
+
+std::map<int, int> Memory::removeFeaturesByWords(
+		const std::map<int, std::vector<int> > & wordsPerNode,
+		int floorPerNode,
+		bool dryRun)
+{
+	// HERoEHS lifelong: 특징 단위 free-space 증거 경로 — 호출자가 (노드, word id) 목록을
+	// 직접 지목해 제거. 존재하지 않는 word는 무시, 하한/아카이브 규칙은 박스 버전과 동일.
+	std::map<int, int> removedPerNode;
+	int totalRemoved = 0;
+	for(std::map<int, std::vector<int> >::const_iterator iter=wordsPerNode.begin();
+		iter!=wordsPerNode.end(); ++iter)
+	{
+		Signature * s = this->_getSignature(iter->first);
+		if(s == 0 || iter->second.empty())
+		{
+			continue;
+		}
+		const std::multimap<int, int> & words = s->getWords();
+		const std::vector<cv::KeyPoint> & kpts = s->getWordsKpts();
+		if(words.empty() || kpts.size() != words.size())
+		{
+			continue;
+		}
+		// 요청 word 중 실제 존재하는 것만 후보로 (word별 최대 응답은 하한 트리밍용)
+		std::map<int, float> candidates;
+		for(unsigned int i=0; i<iter->second.size(); ++i)
+		{
+			int wordId = iter->second[i];
+			if(wordId <= 0)
+			{
+				continue;
+			}
+			std::pair<std::multimap<int, int>::const_iterator, std::multimap<int, int>::const_iterator>
+					range = words.equal_range(wordId);
+			for(std::multimap<int, int>::const_iterator jter=range.first; jter!=range.second; ++jter)
+			{
+				if(jter->second < 0)
+				{
+					continue;
+				}
+				float response = kpts[jter->second].response;
+				std::map<int, float>::iterator cter = candidates.find(wordId);
+				if(cter == candidates.end())
+				{
+					candidates.insert(std::make_pair(wordId, response));
+				}
+				else if(response > cter->second)
+				{
+					cter->second = response;
+				}
+			}
+		}
+		if(candidates.empty())
+		{
+			continue;
+		}
+		std::set<int> wordsToRemove = this->selectRemovableWords(*s, candidates, floorPerNode);
+		if(wordsToRemove.empty())
+		{
+			continue;
+		}
+		removedPerNode.insert(std::make_pair(s->id(), (int)wordsToRemove.size()));
+		totalRemoved += (int)wordsToRemove.size();
+		if(dryRun)
+		{
+			continue;
+		}
+		this->removeWordsFromSignature(s, wordsToRemove);
+	}
+	if(!dryRun && totalRemoved > 0 && _vwd->isIncremental())
+	{
+		this->cleanUnusedWords();
+	}
+	UINFO("removeFeaturesByWords: requested nodes=%d, affected=%d, words removed=%d dryRun=%d",
+			(int)wordsPerNode.size(), (int)removedPerNode.size(), totalRemoved, dryRun?1:0);
+	return removedPerNode;
+}
+
+std::set<int> Memory::selectRemovableWords(
+		const Signature & s,
+		const std::map<int, float> & candidates,
+		int floorPerNode) const
+{
+	// 특징 고갈 방어: 노드에 floorPerNode개 유니크 단어는 남긴다 (초과분만, 응답 낮은 순 제거)
+	std::set<int> wordsToRemove;
+	int uniqueWords = (int)uUniqueKeys(s.getWords()).size();
+	int allowed = uniqueWords - floorPerNode;
+	if(allowed <= 0)
+	{
+		UWARN("Node %d has only %d unique words (floor=%d), %d candidates kept.",
+				s.id(), uniqueWords, floorPerNode, (int)candidates.size());
+		return wordsToRemove;
+	}
+	if((int)candidates.size() <= allowed)
+	{
+		for(std::map<int, float>::const_iterator cter=candidates.begin(); cter!=candidates.end(); ++cter)
+		{
+			wordsToRemove.insert(cter->first);
+		}
+	}
+	else
+	{
+		std::multimap<float, int> byResponse; // 응답 오름차순 — 약한 특징부터 제거
+		for(std::map<int, float>::const_iterator cter=candidates.begin(); cter!=candidates.end(); ++cter)
+		{
+			byResponse.insert(std::make_pair(cter->second, cter->first));
+		}
+		for(std::multimap<float, int>::const_iterator bter=byResponse.begin();
+			bter!=byResponse.end() && (int)wordsToRemove.size() < allowed; ++bter)
+		{
+			wordsToRemove.insert(bter->second);
+		}
+	}
+	return wordsToRemove;
+}
+
+void Memory::removeWordsFromSignature(
+		Signature * s,
+		const std::set<int> & wordsToRemove)
+{
+	// RAM 재구성: 생존 인스턴스만으로 배열 재구축 (키포인트 인덱스 재부여) + 사전 참조·DB 반영
+	const std::multimap<int, int> & words = s->getWords();
+	const std::vector<cv::KeyPoint> & kpts = s->getWordsKpts();
+	const std::vector<cv::Point3f> & words3 = s->getWords3();
+	const cv::Mat & descriptors = s->getWordsDescriptors();
+	bool wasEnabled = s->isEnabled();
+	if(wasEnabled)
+	{
+		this->disableWordsRef(s->id()); // 사전 참조 해제 — 아래 enableWordsRef로 생존분 재등록
+	}
+	std::multimap<int, int> newWords;
+	std::vector<cv::KeyPoint> newKpts;
+	std::vector<cv::Point3f> newWords3;
+	cv::Mat newDescriptors;
+	for(std::multimap<int, int>::const_iterator jter=words.begin(); jter!=words.end(); ++jter)
+	{
+		if(wordsToRemove.find(jter->first) != wordsToRemove.end())
+		{
+			continue;
+		}
+		newWords.insert(std::make_pair(jter->first, (int)newKpts.size()));
+		newKpts.push_back(kpts[jter->second]);
+		newWords3.push_back(words3[jter->second]);
+		if(!descriptors.empty())
+		{
+			newDescriptors.push_back(descriptors.row(jter->second));
+		}
+	}
+	s->setWords(newWords, newKpts, newWords3, newDescriptors);
+	if(wasEnabled)
+	{
+		std::list<int> ids;
+		ids.push_back(s->id());
+		this->enableWordsRef(ids);
+	}
+	s->setModified(true);
+	if(_dbDriver)
+	{
+		_dbDriver->removeFeatures(s->id(), std::vector<int>(wordsToRemove.begin(), wordsToRemove.end()));
+	}
+	_memoryChanged = true;
 }
 
 void Memory::enableWordsRef(const std::list<int> & signatureIds)
