@@ -154,6 +154,12 @@ public:
 			const std::map<int, std::vector<int> > & wordsPerNode,
 			int floorPerNode = 50,
 			bool dryRun = false);
+	// HERoEHS lifelong: 운영 중 현재 관측을 영구 노드로 편입(등장 경로). mapPose는 map 프레임
+	// 현재 pose(보정×odom). 최근접 최적화 노드에 링크·mapId 상속. 반환: 새 노드 id (실패 0).
+	int ingestNode(
+			const SensorData & data,
+			const Transform & mapPose,
+			const cv::Mat & covariance);
 	Transform getPose(int locationId) const;
 	Transform getMapCorrection() const {return _mapCorrection;}
 	const Memory * getMemory() const {return _memory;}

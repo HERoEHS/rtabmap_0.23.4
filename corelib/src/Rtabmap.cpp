@@ -6613,6 +6613,36 @@ std::map<int, int> Rtabmap::removeFeaturesByWords(
 	return _memory->removeFeaturesByWords(wordsPerNode, floorPerNode, dryRun);
 }
 
+int Rtabmap::ingestNode(
+		const SensorData & data,
+		const Transform & mapPose,
+		const cv::Mat & covariance)
+{
+	if(_memory == 0)
+	{
+		UERROR("Memory is not initialized, cannot ingest node!");
+		return 0;
+	}
+	if(mapPose.isNull() || _optimizedPoses.empty())
+	{
+		UERROR("ingestNode: no valid map pose or optimized graph.");
+		return 0;
+	}
+	int nearestId = graph::findNearestNode(_optimizedPoses, mapPose);
+	if(nearestId <= 0)
+	{
+		UERROR("ingestNode: no nearest node found.");
+		return 0;
+	}
+	int newId = _memory->ingestNode(data, mapPose, nearestId, covariance);
+	if(newId > 0)
+	{
+		// 최적화 pose 캐시에 즉시 반영 — mapGraph 발행·이후 질의에서 보이도록
+		_optimizedPoses.insert(std::make_pair(newId, mapPose));
+	}
+	return newId;
+}
+
 void Rtabmap::clearPath(int status)
 {
 	UINFO("status=%d", status);

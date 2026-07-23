@@ -162,6 +162,15 @@ public:
 			const std::map<int, std::vector<int> > & wordsPerNode,
 			int floorPerNode = 50,
 			bool dryRun = false);
+	// HERoEHS lifelong: 운영(localization) 중 현재 관측을 영구 노드로 편입 — 등장(추가) 경로.
+	// 매핑 파이프라인의 createSignature를 재사용하되 STM 체인을 우회해 linkToId에 직접
+	// kNeighbor 링크를 건다(localization STM은 매 사이클 폐기되므로). mapId는 linkToId에서
+	// 상속. pose는 map 프레임 최적화 pose. 반환: 새 노드 id (실패 시 0).
+	int ingestNode(
+			const SensorData & data,
+			const Transform & pose,
+			int linkToId,
+			const cv::Mat & covariance);
 
 	//getters
 	const std::map<int, double> & getWorkingMem() const {return _workingMem;}

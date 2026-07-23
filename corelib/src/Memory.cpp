@@ -6774,6 +6774,78 @@ std::map<int, int> Memory::removeFeaturesByWords(
 	return removedPerNode;
 }
 
+int Memory::ingestNode(
+		const SensorData & data,
+		const Transform & pose,
+		int linkToId,
+		const cv::Mat & covariance)
+{
+	// HERoEHS lifelong: 등장(추가) 경로 — 운영 중 현재 관측을 영구 노드로 편입.
+	Signature * neighbor = this->_getSignature(linkToId);
+	if(neighbor == 0)
+	{
+		UERROR("ingestNode: link target %d not in WM/STM!", linkToId);
+		return 0;
+	}
+	if(pose.isNull() || neighbor->getPose().isNull())
+	{
+		UERROR("ingestNode: null pose (new or neighbor %d)!", linkToId);
+		return 0;
+	}
+	UASSERT(covariance.cols == 6 && covariance.rows == 6 && covariance.type() == CV_64FC1);
+
+	// mapId 상속: createSignature는 _idMapCount를 사용 — 스코프 오버라이드 후 복원
+	int mapIdBackup = _idMapCount;
+	_idMapCount = neighbor->mapId();
+	Signature * s = this->createSignature(data, pose, 0);
+	_idMapCount = mapIdBackup;
+	if(s == 0)
+	{
+		UERROR("ingestNode: signature creation failed!");
+		return 0;
+	}
+	if(s->isBadSignature())
+	{
+		UWARN("ingestNode: bad signature (too few features), dropped.");
+		// createSignature가 등록한 사전 참조를 수동 해제 (아직 _signatures에 없음)
+		const std::list<int> & keys = uUniqueKeys(s->getWords());
+		for(std::list<int>::const_iterator i=keys.begin(); i!=keys.end(); ++i)
+		{
+			if(*i > 0)
+			{
+				_vwd->removeAllWordRef(*i, s->id());
+			}
+		}
+		delete s;
+		return 0;
+	}
+
+	// 그래프 편입: STM 우회, WM 직접 삽입
+	_signatures.insert(std::make_pair(s->id(), s));
+	_workingMem.insert(std::make_pair(s->id(), UTimer::now()));
+
+	// 이웃 링크 (양방향, T_from_to 규약): T = neighbor.pose^-1 * new.pose
+	Transform t = neighbor->getPose().inverse() * pose;
+	cv::Mat infMatrix = covariance.inv();
+	neighbor->addLink(Link(linkToId, s->id(), Link::kNeighbor, t, infMatrix));
+	s->addLink(Link(s->id(), linkToId, Link::kNeighbor, t.inverse(), infMatrix));
+
+	// DB 반영 (saveLocationData 관용구)
+	if(_dbDriver && !_dbDriver->isInMemory())
+	{
+		Signature * cpy = new Signature();
+		*cpy = *s;
+		_dbDriver->asyncSave(cpy);
+		s->setSaved(true);
+		s->sensorData().clearCompressedData();
+	}
+	_memoryChanged = true;
+	_linksChanged = true;
+	UINFO("ingestNode: new node %d (mapId=%d) linked to %d, %d unique words.",
+			s->id(), s->mapId(), linkToId, (int)uUniqueKeys(s->getWords()).size());
+	return s->id();
+}
+
 std::set<int> Memory::selectRemovableWords(
 		const Signature & s,
 		const std::map<int, float> & candidates,
