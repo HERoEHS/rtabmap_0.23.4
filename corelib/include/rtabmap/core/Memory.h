@@ -144,6 +144,18 @@ public:
 	void saveLocationData(int locationId);
 	void removeLink(int idA, int idB);
 	void removeRawData(int id, bool image = true, bool scan = true, bool userData = true);
+	// HERoEHS lifelong: map 프레임 AABB 안에 3D 위치가 들어가는 시각 특징(visual word)을
+	// WM 시그니처들에서 제거하고 DB Feature 테이블에도 반영한다(Feature_archive로 이동 후 삭제).
+	// 제거 단위는 노드별 유니크 word id — 같은 word의 모든 인스턴스가 함께 제거되어야
+	// RAM(멀티맵)과 DB(행)가 일치한다. poses: 노드 id → map 프레임 최적화 pose.
+	// floorPerNode: 노드에 남길 최소 유니크 단어 수(특징 고갈 방어; 초과분만 응답 낮은 순 제거).
+	// dryRun: 수정 없이 집계만. 반환: 노드 id → 제거된(될) 유니크 단어 수.
+	std::map<int, int> removeFeaturesInBox(
+			const cv::Point3f & boxMin,
+			const cv::Point3f & boxMax,
+			const std::map<int, Transform> & poses,
+			int floorPerNode = 50,
+			bool dryRun = false);
 
 	//getters
 	const std::map<int, double> & getWorkingMem() const {return _workingMem;}

@@ -89,6 +89,8 @@ public:
 	void addLink(const Link & link);
 	void removeLink(int from, int to);
 	void updateLink(const Link & link);
+	// HERoEHS lifelong: 노드의 특정 word 특징 행을 Feature_archive로 이동 후 삭제(가역 제거)
+	void removeFeatures(int nodeId, const std::vector<int> & wordIds);
 	void updateOccupancyGrid(
 				int nodeId,
 				const cv::Mat & ground,

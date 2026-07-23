@@ -6579,6 +6579,26 @@ void Rtabmap::addNodesToRepublish(const std::vector<int> & ids)
 	}
 }
 
+std::map<int, int> Rtabmap::removeFeaturesInBox(
+		const cv::Point3f & boxMin,
+		const cv::Point3f & boxMax,
+		int floorPerNode,
+		bool dryRun)
+{
+	std::map<int, int> result;
+	if(_memory == 0)
+	{
+		UERROR("Memory is not initialized, cannot remove features!");
+		return result;
+	}
+	if(_optimizedPoses.empty())
+	{
+		UWARN("No optimized poses yet (localization not initialized?), nothing done.");
+		return result;
+	}
+	return _memory->removeFeaturesInBox(boxMin, boxMax, _optimizedPoses, floorPerNode, dryRun);
+}
+
 void Rtabmap::clearPath(int status)
 {
 	UINFO("status=%d", status);

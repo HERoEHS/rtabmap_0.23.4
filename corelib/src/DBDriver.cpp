@@ -488,6 +488,25 @@ void DBDriver::updateLink(const Link & link)
 	this->updateLinkQuery(link);
 	_dbSafeAccessMutex.unlock();
 }
+void DBDriver::removeFeatures(int nodeId, const std::vector<int> & wordIds)
+{
+	// HERoEHS lifelong: 삭제 대신 아카이브 이동 — 오검출 시 INSERT INTO Feature SELECT ... 로 복원 가능
+	if(wordIds.empty())
+	{
+		return;
+	}
+	if(uStrNumCmp(this->getDatabaseVersion(), "0.13.0") < 0)
+	{
+		UERROR("removeFeatures() requires database version >= 0.13.0 (Feature table), version is %s", this->getDatabaseVersion().c_str());
+		return;
+	}
+	this->executeNoResult("CREATE TABLE IF NOT EXISTS Feature_archive AS SELECT * FROM Feature WHERE 0;");
+	for(unsigned int i=0; i<wordIds.size(); ++i)
+	{
+		this->executeNoResult(uFormat("INSERT INTO Feature_archive SELECT * FROM Feature WHERE node_id=%d AND word_id=%d;", nodeId, wordIds[i]));
+		this->executeNoResult(uFormat("DELETE FROM Feature WHERE node_id=%d AND word_id=%d;", nodeId, wordIds[i]));
+	}
+}
 void DBDriver::updateOccupancyGrid(
 		int nodeId,
 		const cv::Mat & ground,

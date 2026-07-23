@@ -142,6 +142,13 @@ public:
 	const Statistics & getStatistics() const;
 	const std::map<int, Transform> & getLocalOptimizedPoses() const {return _optimizedPoses;}
 	const std::multimap<int, Link> & getLocalConstraints() const {return _constraints;}
+	// HERoEHS lifelong: 최적화 그래프 pose 기준으로 map 프레임 AABB 안의 시각 특징을
+	// 제거(가역 아카이브)한다. Memory::removeFeaturesInBox 위임. 반환: 노드 id → 제거 단어 수.
+	std::map<int, int> removeFeaturesInBox(
+			const cv::Point3f & boxMin,
+			const cv::Point3f & boxMax,
+			int floorPerNode = 50,
+			bool dryRun = false);
 	Transform getPose(int locationId) const;
 	Transform getMapCorrection() const {return _mapCorrection;}
 	const Memory * getMemory() const {return _memory;}
