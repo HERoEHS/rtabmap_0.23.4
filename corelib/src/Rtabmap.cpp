@@ -2762,6 +2762,29 @@ bool Rtabmap::process(
 					//find the nearest pose on the path looking in the same direction
 					path.insert(std::make_pair(signature->id(), _optimizedPoses.at(signature->id())));
 					path = graph::findNearestPoses(signature->id(), path, _localRadius, _proximityAngle);
+					// HERoEHS lifelong: 은퇴(무특징) 노드는 근접 후보에서 제외.
+					// 거리 기반 선정은 특징 유무를 모르는데 정합(computeTransform)은
+					// 양쪽 word를 요구한다 — 무특징 노드가 로봇 옆에 있으면 매 사이클
+					// 최근접으로 뽑혀 실패를 반복(실측 6분에 301회, setup 3.56)하고
+					// path 슬롯(_proximityMaxPaths)을 소모해 이웃 정상 노드의 기회를
+					// 뺏는다. 좀비 노드는 위상 유지용이며 후보가 아니다.
+					for(std::map<int, Transform>::iterator pit=path.begin(); pit!=path.end(); )
+					{
+						const Signature * ps = _memory->getSignature(pit->first);
+						if(ps && pit->first != signature->id() && ps->getWords().empty())
+						{
+							pit = path.erase(pit);
+						}
+						else
+						{
+							++pit;
+						}
+					}
+					if(path.empty() ||
+					   (path.size()==1 && path.begin()->first == signature->id()))
+					{
+						continue;
+					}
 					//take the one with highest likelihood if not null
 					int nearestId = 0;
 					if(iter->first.likelihood > 0.0f &&

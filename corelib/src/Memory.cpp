@@ -6794,6 +6794,39 @@ int Memory::ingestNode(
 	}
 	UASSERT(covariance.cols == 6 && covariance.rows == 6 && covariance.type() == CV_64FC1);
 
+	// HERoEHS lifelong: 그래프 강성 — 이웃 링크가 1개면 매달린 잎이 되어 제약이
+	// 약하고, LC 하나에 끌려가 다음 근접 탐색에서 더 가까워지는 양의 되먹임으로
+	// LC 흡인체가 된다(실측: 노드 912가 근접 LC의 80% 독식 — setup 3.53②).
+	// 앵커의 체인 이웃 중 새 pose에 가장 가까운 노드를 2번째 이웃으로 **요구**한다.
+	// 못 찾으면 삽입 거부(fail-closed) — 삽입은 삭제보다 위험하다는 원칙(3.40).
+	Signature * neighbor2 = 0;
+	float bestDist2 = -1.0f;
+	const std::multimap<int, Link> & anchorLinks = neighbor->getLinks();
+	for(std::multimap<int, Link>::const_iterator iter=anchorLinks.begin(); iter!=anchorLinks.end(); ++iter)
+	{
+		if(iter->second.type() != Link::kNeighbor || iter->first == linkToId)
+		{
+			continue;
+		}
+		Signature * cand = this->_getSignature(iter->first);
+		if(cand == 0 || cand->getPose().isNull())
+		{
+			continue;
+		}
+		float d = pose.getDistance(cand->getPose());
+		if(bestDist2 < 0.0f || d < bestDist2)
+		{
+			bestDist2 = d;
+			neighbor2 = cand;
+		}
+	}
+	if(neighbor2 == 0)
+	{
+		UWARN("ingestNode: anchor %d has no reachable chain neighbor for a 2nd link "
+			  "(graph rigidity requires >=2) — ingestion refused.", linkToId);
+		return 0;
+	}
+
 	// mapId 상속: createSignature는 _idMapCount를 사용 — 스코프 오버라이드 후 복원
 	int mapIdBackup = _idMapCount;
 	_idMapCount = neighbor->mapId();
@@ -6829,6 +6862,10 @@ int Memory::ingestNode(
 	cv::Mat infMatrix = covariance.inv();
 	neighbor->addLink(Link(linkToId, s->id(), Link::kNeighbor, t, infMatrix));
 	s->addLink(Link(s->id(), linkToId, Link::kNeighbor, t.inverse(), infMatrix));
+	// HERoEHS lifelong: 2번째 이웃 링크 — 위 강성 요구의 실제 결선 (같은 pose 규약)
+	Transform t2 = neighbor2->getPose().inverse() * pose;
+	neighbor2->addLink(Link(neighbor2->id(), s->id(), Link::kNeighbor, t2, infMatrix));
+	s->addLink(Link(s->id(), neighbor2->id(), Link::kNeighbor, t2.inverse(), infMatrix));
 
 	// DB 반영 (saveLocationData 관용구)
 	if(_dbDriver && !_dbDriver->isInMemory())
@@ -6841,8 +6878,9 @@ int Memory::ingestNode(
 	}
 	_memoryChanged = true;
 	_linksChanged = true;
-	UINFO("ingestNode: new node %d (mapId=%d) linked to %d, %d unique words.",
-			s->id(), s->mapId(), linkToId, (int)uUniqueKeys(s->getWords()).size());
+	UINFO("ingestNode: new node %d (mapId=%d) linked to %d and %d (dist %.2fm), %d unique words.",
+			s->id(), s->mapId(), linkToId, neighbor2->id(), bestDist2,
+			(int)uUniqueKeys(s->getWords()).size());
 	return s->id();
 }
 
@@ -7032,7 +7070,12 @@ void Memory::enableWordsRef(const std::list<int> & signatureIds)
 			{
 				if(keys.at(i)>0)
 				{
-					if(_vwd->addWordRef(keys.at(i), (*j)->id()))
+					// HERoEHS lifelong: 조건 반전 수정 (상류 8051be45b 버그).
+					// addWordRef는 **성공 시 true**를 반환하는데 성공을 에러로 찍고
+					// 있었다. LTM→WM 복귀 경로라 MemoryThr를 켜야 드러난다 —
+					// 우리 설정(memory_thr=350)에서 초당 1,452건, 11분에 108만 줄
+					// (로그의 97.8%, 140MB) 실측. 기능 손실은 아니었고 순수 로그 오염.
+					if(!_vwd->addWordRef(keys.at(i), (*j)->id()))
 					{
 						UERROR("Could not add word ref %d to node %d!?", keys.at(i), (*j)->id());
 					}
