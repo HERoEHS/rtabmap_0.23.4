@@ -363,11 +363,15 @@ bool DBDriverSqlite3::connectDatabaseQuery(const std::string & url, bool overwri
 	}
 	if(rc != SQLITE_OK)
 	{
-		UFATAL("DB error : %s (path=\"%s\"). Make sure that your user has write " 
+		UFATAL("DB error : %s (path=\"%s\"). Make sure that your user has write "
 			"permission on the target directory (you may have to change the working directory). ", sqlite3_errmsg(_ppDb), url.c_str());
 		_ppDb = 0;
 		return false;
 	}
+	// HERoEHS lifelong: 동시 리더(지속성 노드·매니저의 read-only 폴링)와 COMMIT이
+	// 겹치면 SQLITE_BUSY가 즉시 UFATAL로 승격돼 rtabmap이 통째로 죽는다(setup 3.72
+	// 라이브 실측). busy 핸들러로 2초까지 재시도 — ms급 리더와의 충돌은 사실상 소멸.
+	sqlite3_busy_timeout(_ppDb, 2000);
 
 	if(_dbInMemory && dbFileExist)
 	{
