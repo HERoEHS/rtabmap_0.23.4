@@ -2023,7 +2023,8 @@ bool Rtabmap::process(
 				{
 					const Signature * s = _memory->getSignature(iter->first);
 					UASSERT(s!=0);
-					if(s->getWeight() != -1) // ignore intermediate nodes
+					if(s->getWeight() != -1 && // ignore intermediate nodes
+					   s->getWeight() != Memory::kQuarantinedWeight) // HERoEHS lifelong: 격리(보호관찰 중) 노드 제외
 					{
 						bool accept = true;
 						if(originGPS.stamp()>0.0)
@@ -2771,7 +2772,10 @@ bool Rtabmap::process(
 					for(std::map<int, Transform>::iterator pit=path.begin(); pit!=path.end(); )
 					{
 						const Signature * ps = _memory->getSignature(pit->first);
-						if(ps && pit->first != signature->id() && ps->getWords().empty())
+						// HERoEHS lifelong: 격리(보호관찰 중) 노드도 후보가 아니다 — 검증 전 노드에 위치추정하면
+						// 그 pose 로 자기를 채점하게 된다 (2026-09 merge_test1: 삽입 2.8 s 뒤 자기 자신에게 LC).
+						if(ps && pit->first != signature->id() &&
+						   (ps->getWords().empty() || ps->getWeight() == Memory::kQuarantinedWeight))
 						{
 							pit = path.erase(pit);
 						}
@@ -2905,6 +2909,23 @@ bool Rtabmap::process(
 						std::map<int, Transform> path = iter->second; // should contain only nodes (no landmarks)
 						UASSERT(path.size());
 						UASSERT(path.begin()->first > 0);
+						// HERoEHS lifelong: 격리 노드는 스캔 정합 근접 후보도, 합칠 스캔도 아니다 (위 시각 근접과 같은 규칙)
+						for(std::map<int, Transform>::iterator pit=path.begin(); pit!=path.end(); )
+						{
+							const Signature * ps = _memory->getSignature(pit->first);
+							if(ps && ps->getWeight() == Memory::kQuarantinedWeight)
+							{
+								path.erase(pit++);
+							}
+							else
+							{
+								++pit;
+							}
+						}
+						if(path.empty())
+						{
+							continue;
+						}
 
 						//find the nearest pose on the path
 						int nearestId = rtabmap::graph::findNearestNode(path, _optimizedPoses.at(signature->id()));
@@ -5825,8 +5846,12 @@ int Rtabmap::detectMoreLoopClosures(
 
 							Signature fromS = getSignatureCopy(from, false, true, false, false, true, false);
 							Signature toS = getSignatureCopy(to, false, true, false, false, true, false);
-							UASSERT(fromS.getWeight()>=0);
-							UASSERT(toS.getWeight()>=0);
+							// HERoEHS lifelong: upstream 은 UASSERT(≥0) — 격리(-2) 노드가 끼면 서비스 호출이 프로세스를
+							// 죽였다. 그런 쌍은 LC 후보가 아니므로 건너뛴다.
+							if(fromS.getWeight() < 0 || toS.getWeight() < 0)
+							{
+								continue;
+							}
 
 							Transform guess;
 							if(_proximityBySpace && uContains(poses, from) && uContains(poses, to))
@@ -6651,19 +6676,121 @@ int Rtabmap::ingestNode(
 		UERROR("ingestNode: no valid map pose or optimized graph.");
 		return 0;
 	}
-	int nearestId = graph::findNearestNode(_optimizedPoses, mapPose);
+	// HERoEHS lifelong: 격리(보호관찰 중) 노드는 앵커가 아니다 — pose 가 검증 전이고, 불합격으로 삭제되면
+	// 새 노드의 링크가 같이 끊긴다. WM 에 없는 id(랜드마크 등)도 뺀다(Memory::ingestNode 가 거부).
+	std::map<int, Transform> anchorCandidates;
+	for(std::map<int, Transform>::const_iterator iter=_optimizedPoses.begin(); iter!=_optimizedPoses.end(); ++iter)
+	{
+		const Signature * s = iter->first > 0 ? _memory->getSignature(iter->first) : 0;
+		if(s && s->getWeight() != Memory::kQuarantinedWeight)
+		{
+			anchorCandidates.insert(*iter);
+		}
+	}
+	int nearestId = graph::findNearestNode(anchorCandidates, mapPose);
 	if(nearestId <= 0)
 	{
 		UERROR("ingestNode: no nearest node found.");
 		return 0;
 	}
-	int newId = _memory->ingestNode(data, mapPose, nearestId, covariance);
+	int newId = _memory->ingestNode(data, mapPose, nearestId, covariance, _optimizedPoses);
 	if(newId > 0)
 	{
 		// 최적화 pose 캐시에 즉시 반영 — mapGraph 발행·이후 질의에서 보이도록
 		_optimizedPoses.insert(std::make_pair(newId, mapPose));
 	}
 	return newId;
+}
+
+int Rtabmap::setNodesQuarantined(const std::vector<int> & ids, bool quarantined)
+{
+	if(_memory == 0)
+	{
+		return 0;
+	}
+	int n = 0;
+	for(size_t i=0; i<ids.size(); ++i)
+	{
+		if(_memory->setQuarantined(ids[i], quarantined))
+		{
+			++n;
+		}
+	}
+	return n;
+}
+
+std::vector<int> Rtabmap::deleteNodes(const std::vector<int> & ids)
+{
+	std::vector<int> deleted;
+	if(_memory == 0)
+	{
+		return deleted;
+	}
+	for(size_t i=0; i<ids.size(); ++i)
+	{
+		const int id = ids[i];
+		if(!_memory->deleteNode(id))
+		{
+			continue;
+		}
+		deleted.push_back(id);
+		// 이 객체가 들고 있는 그래프 캐시에서도 지운다 — 남으면 다음 최적화·발행이 없는 노드를 가리킨다
+		_optimizedPoses.erase(id);
+		for(std::multimap<int, Link>::iterator iter=_constraints.begin(); iter!=_constraints.end();)
+		{
+			if(iter->second.from() == id || iter->second.to() == id)
+			{
+				_constraints.erase(iter++);
+			}
+			else
+			{
+				++iter;
+			}
+		}
+		_odomCachePoses.erase(id);
+		for(std::multimap<int, Link>::iterator iter=_odomCacheConstraints.begin(); iter!=_odomCacheConstraints.end();)
+		{
+			if(iter->second.from() == id || iter->second.to() == id)
+			{
+				_odomCacheConstraints.erase(iter++);
+			}
+			else
+			{
+				++iter;
+			}
+		}
+		_nodesToRepublish.erase(id);
+		_gpsGeocentricCache.erase(id);
+		if(_globalScanMapPoses.find(id) != _globalScanMapPoses.end())
+		{
+			// 전역 스캔 맵에 이 노드 스캔이 섞여 있다 — upstream 의 신호 재로드 때처럼 비운다(이번 세션은 미사용)
+			UWARN("deleteNodes: node %d is in the global scan map — clearing it", id);
+			_globalScanMap.clear();
+			_globalScanMapPoses.clear();
+		}
+		if(_lastLocalizationNodeId == id)
+		{
+			_lastLocalizationNodeId = 0;
+		}
+		if(_highestHypothesis.first == id)
+		{
+			_highestHypothesis = std::make_pair(0, 0.0f);
+		}
+		if(_loopClosureHypothesis.first == id)
+		{
+			_loopClosureHypothesis = std::make_pair(0, 0.0f);
+		}
+		for(size_t j=0; j<_path.size(); ++j)
+		{
+			if(_path[j].first == id)
+			{
+				UWARN("deleteNodes: node %d is on the current path — path cleared", id);
+				this->clearPath(-1);
+				break;
+			}
+		}
+	}
+	return deleted;
 }
 
 void Rtabmap::clearPath(int status)

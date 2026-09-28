@@ -165,12 +165,29 @@ public:
 	// HERoEHS lifelong: 운영(localization) 중 현재 관측을 영구 노드로 편입 — 등장(추가) 경로.
 	// 매핑 파이프라인의 createSignature를 재사용하되 STM 체인을 우회해 linkToId에 직접
 	// kNeighbor 링크를 건다(localization STM은 매 사이클 폐기되므로). mapId는 linkToId에서
-	// 상속. pose는 map 프레임 최적화 pose. 반환: 새 노드 id (실패 시 0).
+	// 상속. pose는 map 프레임 최적화 pose, optimizedPoses는 그 pose가 속한 최적화 그래프
+	// (앵커들의 map 프레임 pose). 링크는 map 프레임 상대 pose로, 저장 pose는 앵커와 같은
+	// raw odom 프레임으로 기록한다 — 기존 노드와 같은 규약이라 재최적화해도 제자리.
+	// 반환: 새 노드 id (실패 시 0).
 	int ingestNode(
 			const SensorData & data,
 			const Transform & pose,
 			int linkToId,
-			const cv::Mat & covariance);
+			const cv::Mat & covariance,
+			const std::map<int, Transform> & optimizedPoses);
+	// HERoEHS lifelong: 격리(quarantine) 표시 weight. 삽입 노드는 이 값으로 태어나 보호관찰을 통과해야
+	// 풀린다. 격리 노드는 전역 LC·근접 후보에서 빠지지만(Rtabmap.cpp) 그래프 최적화에는 보통 노드로
+	// 참여한다 — -1(intermediate)과 다르다: getMetricConstraints 는 -1 만 건너뛴다. Node.weight 로 DB 에
+	// 남으므로 재기동·비정상 종료 뒤에도 첫 처리부터 후보에서 빠진다.
+	static const int kQuarantinedWeight = -2;
+	// HERoEHS lifelong: 격리 설정/해제. 격리(-2)↔보통(≥0) 사이만 바꾼다(-1·-9 는 건드리지 않음).
+	// LTM 에 있는 노드는 DB 에서 바로 바꾼다. 반환: 노드가 있으면 true.
+	bool setQuarantined(int id, bool quarantined);
+	// HERoEHS lifelong: WM/LTM 의 격리(kQuarantinedWeight) 노드 영구 삭제 — 메모리 전 노드의 역링크·사전 참조·DB 행
+	// (Node·Data·Feature·Link 양방향·GlobalDescriptor·Statistics·Feature_archive) 전부. upstream moveToTrash 는 STM 밖
+	// 삭제를 지원하지 않고 링크만 끊은 Node 행을 남긴다(재로드하면 고립 노드가 엉뚱한 곳의 LC 대상). STM 노드와
+	// 격리 아닌 노드는 거부(틀린 id 로 정규 맵 노드를 지우는 사고 방지). 반환: 삭제했으면 true.
+	bool deleteNode(int id);
 
 	//getters
 	const std::map<int, double> & getWorkingMem() const {return _workingMem;}

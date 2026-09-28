@@ -91,6 +91,11 @@ public:
 	void updateLink(const Link & link);
 	// HERoEHS lifelong: 노드의 특정 word 특징 행을 Feature_archive로 이동 후 삭제(가역 제거)
 	void removeFeatures(int nodeId, const std::vector<int> & wordIds);
+	// HERoEHS lifelong: 노드 행 영구 삭제 (한 트랜잭션). Memory::deleteNode 가 부른다.
+	void deleteNode(int nodeId);
+	// HERoEHS lifelong: Node.weight 조건부 갱신 — weight 가 fromWeight 조건을 만족할 때만 toWeight 로.
+	// fromWeight >= 0 이면 "weight >= 0", 음수면 "weight == fromWeight".
+	void updateNodeWeight(int nodeId, int fromWeight, int toWeight);
 	void updateOccupancyGrid(
 				int nodeId,
 				const cv::Mat & ground,

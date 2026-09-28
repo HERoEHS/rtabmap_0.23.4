@@ -507,6 +507,49 @@ void DBDriver::removeFeatures(int nodeId, const std::vector<int> & wordIds)
 		this->executeNoResult(uFormat("DELETE FROM Feature WHERE node_id=%d AND word_id=%d;", nodeId, wordIds[i]));
 	}
 }
+void DBDriver::deleteNode(int nodeId)
+{
+	// HERoEHS lifelong: 한 트랜잭션 — 도중에 죽어도 "링크만 끊긴 고립 노드"나 "없는 노드를 가리키는 링크"가
+	// 남지 않게. 비동기 저장 대기열을 먼저 비운다(이 노드가 대기 중이면 삭제 뒤 다시 써지는 것을 막는다).
+	if(nodeId <= 0)
+	{
+		return;
+	}
+	const std::string version = this->getDatabaseVersion();
+	this->emptyTrashes();
+	// 잠금 순서는 emptyTrashes 와 같게(dbSafe → transaction) — 거꾸로면 비동기 휴지통 스레드와 교착한다
+	_dbSafeAccessMutex.lock();
+	this->beginTransaction();
+	this->executeNoResultQuery(uFormat("DELETE FROM Link WHERE from_id=%d OR to_id=%d;", nodeId, nodeId));
+	if(uStrNumCmp(version, "0.13.0") >= 0)
+	{
+		this->executeNoResultQuery(uFormat("DELETE FROM Feature WHERE node_id=%d;", nodeId));
+		// removeFeatures 가 만드는 아카이브 — 없으면 만들어 두고 지운다(없는 테이블 DELETE 는 UASSERT)
+		this->executeNoResultQuery("CREATE TABLE IF NOT EXISTS Feature_archive AS SELECT * FROM Feature WHERE 0;");
+		this->executeNoResultQuery(uFormat("DELETE FROM Feature_archive WHERE node_id=%d;", nodeId));
+	}
+	if(uStrNumCmp(version, "0.20.0") >= 0)
+	{
+		this->executeNoResultQuery(uFormat("DELETE FROM GlobalDescriptor WHERE node_id=%d;", nodeId));
+	}
+	if(uStrNumCmp(version, "0.11.11") >= 0)
+	{
+		this->executeNoResultQuery(uFormat("DELETE FROM Statistics WHERE id=%d;", nodeId));
+	}
+	this->executeNoResultQuery(uFormat("DELETE FROM Data WHERE id=%d;", nodeId));
+	this->executeNoResultQuery(uFormat("DELETE FROM Node WHERE id=%d;", nodeId));
+	this->commit();
+	_dbSafeAccessMutex.unlock();
+}
+
+void DBDriver::updateNodeWeight(int nodeId, int fromWeight, int toWeight)
+{
+	this->emptyTrashes();   // 대기 중인 옛 weight 저장이 이 갱신을 덮어쓰지 않게
+	this->executeNoResult(fromWeight >= 0 ?
+			uFormat("UPDATE Node SET weight=%d WHERE id=%d AND weight>=0;", toWeight, nodeId) :
+			uFormat("UPDATE Node SET weight=%d WHERE id=%d AND weight=%d;", toWeight, nodeId, fromWeight));
+}
+
 void DBDriver::updateOccupancyGrid(
 		int nodeId,
 		const cv::Mat & ground,

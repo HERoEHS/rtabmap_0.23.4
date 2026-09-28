@@ -160,6 +160,10 @@ public:
 			const SensorData & data,
 			const Transform & mapPose,
 			const cv::Mat & covariance);
+	// HERoEHS lifelong: 삽입 노드 격리 해제/재격리 (Memory::setQuarantined). 반환: 적용된(존재하는) 노드 수.
+	int setNodesQuarantined(const std::vector<int> & ids, bool quarantined);
+	// HERoEHS lifelong: 노드 영구 삭제 (Memory::deleteNode) + 이 객체의 그래프 캐시 정리. 반환: 삭제된 id.
+	std::vector<int> deleteNodes(const std::vector<int> & ids);
 	Transform getPose(int locationId) const;
 	Transform getMapCorrection() const {return _mapCorrection;}
 	const Memory * getMemory() const {return _memory;}

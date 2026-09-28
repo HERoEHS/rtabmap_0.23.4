@@ -2928,7 +2928,7 @@ void Memory::removeLink(int oldId, int newId)
 		if(oldS->hasLink(newS->id()) && newS->hasLink(oldS->id()))
 		{
 			Link::Type type = oldS->getLinks().find(newS->id())->second.type();
-			if(type == Link::kGlobalClosure && newS->getWeight() > 0)
+			if(type == Link::kGlobalClosure && newS->getWeight() > 0 && oldS->getWeight() >= 0) // HERoEHS lifelong: 격리(-2) 노드 제외
 			{
 				// adjust the weight
 				oldS->setWeight(oldS->getWeight()+1);
@@ -3664,8 +3664,14 @@ bool Memory::addLink(const Link & link, bool addInDatabase)
 
 					// update weights only if the memory is incremental
 					// When reducing the graph, transfer weight to the oldest signature
-					UASSERT(fromS->getWeight() >= 0 && toS->getWeight() >=0);
-					if((_reduceGraph && fromS->id() < toS->id()) ||
+					// HERoEHS lifelong: upstream 은 UASSERT(둘 다 ≥0). 격리(-2) 노드는 LC 후보가 아니라 원래 여기 안
+					// 오지만, 수동 링크(addLink 서비스)로 와도 프로세스가 죽지 않게 가중치 이전만 건너뛴다.
+					if(fromS->getWeight() < 0 || toS->getWeight() < 0)
+					{
+						UWARN("addLink %d<->%d: negative weight (%d/%d, quarantined or intermediate) — weight transfer skipped",
+								fromS->id(), toS->id(), fromS->getWeight(), toS->getWeight());
+					}
+					else if((_reduceGraph && fromS->id() < toS->id()) ||
 					   (!_reduceGraph && fromS->id() > toS->id()))
 					{
 						fromS->setWeight(fromS->getWeight() + toS->getWeight());
@@ -6778,7 +6784,8 @@ int Memory::ingestNode(
 		const SensorData & data,
 		const Transform & pose,
 		int linkToId,
-		const cv::Mat & covariance)
+		const cv::Mat & covariance,
+		const std::map<int, Transform> & optimizedPoses)
 {
 	// HERoEHS lifelong: 등장(추가) 경로 — 운영 중 현재 관측을 영구 노드로 편입.
 	Signature * neighbor = this->_getSignature(linkToId);
@@ -6794,12 +6801,25 @@ int Memory::ingestNode(
 	}
 	UASSERT(covariance.cols == 6 && covariance.rows == 6 && covariance.type() == CV_64FC1);
 
+	// HERoEHS lifelong (2026-09-28): 링크 프레임. Signature::getPose()는 매핑 당시 raw odom
+	// pose이고 pose는 map 프레임이라, 둘을 섞으면(종전 코드) 링크가 앵커의 드리프트 보정량만큼
+	// 틀린다. 캐시된 최적화 pose를 쓰는 동안은 안 보이다가 위치추정 중 전체 재최적화
+	// ("Update map correction")가 돌면 새 노드가 그만큼 끌려가고, 그 결과가 종료 시 저장된다
+	// (실측 보정량 0.4~3.3 m). 링크는 앵커의 map 프레임 pose 기준으로 계산한다.
+	std::map<int, Transform>::const_iterator anchorOpt = optimizedPoses.find(linkToId);
+	if(anchorOpt == optimizedPoses.end() || anchorOpt->second.isNull())
+	{
+		UERROR("ingestNode: anchor %d has no optimized pose — ingestion refused.", linkToId);
+		return 0;
+	}
+
 	// HERoEHS lifelong: 그래프 강성 — 이웃 링크가 1개면 매달린 잎이 되어 제약이
 	// 약하고, LC 하나에 끌려가 다음 근접 탐색에서 더 가까워지는 양의 되먹임으로
 	// LC 흡인체가 된다(실측: 노드 912가 근접 LC의 80% 독식 — setup 3.53②).
 	// 앵커의 체인 이웃 중 새 pose에 가장 가까운 노드를 2번째 이웃으로 **요구**한다.
 	// 못 찾으면 삽입 거부(fail-closed) — 삽입은 삭제보다 위험하다는 원칙(3.40).
 	Signature * neighbor2 = 0;
+	Transform neighbor2Opt;
 	float bestDist2 = -1.0f;
 	const std::multimap<int, Link> & anchorLinks = neighbor->getLinks();
 	for(std::multimap<int, Link>::const_iterator iter=anchorLinks.begin(); iter!=anchorLinks.end(); ++iter)
@@ -6809,15 +6829,18 @@ int Memory::ingestNode(
 			continue;
 		}
 		Signature * cand = this->_getSignature(iter->first);
-		if(cand == 0 || cand->getPose().isNull())
+		std::map<int, Transform>::const_iterator candOpt = optimizedPoses.find(iter->first);
+		if(cand == 0 || cand->getWeight() == kQuarantinedWeight || // 격리 노드는 2번째 이웃도 아니다 (Rtabmap::ingestNode 주석)
+		   candOpt == optimizedPoses.end() || candOpt->second.isNull())
 		{
 			continue;
 		}
-		float d = pose.getDistance(cand->getPose());
+		float d = pose.getDistance(candOpt->second); // 같은 map 프레임끼리 비교
 		if(bestDist2 < 0.0f || d < bestDist2)
 		{
 			bestDist2 = d;
 			neighbor2 = cand;
+			neighbor2Opt = candOpt->second;
 		}
 	}
 	if(neighbor2 == 0)
@@ -6830,7 +6853,11 @@ int Memory::ingestNode(
 	// mapId 상속: createSignature는 _idMapCount를 사용 — 스코프 오버라이드 후 복원
 	int mapIdBackup = _idMapCount;
 	_idMapCount = neighbor->mapId();
-	Signature * s = this->createSignature(data, pose, 0);
+	// 링크(앵커 기준 map 프레임 상대 pose)와 저장 pose(앵커와 같은 raw odom 프레임)를 같은 규약으로:
+	// raw pose를 초기 추정으로 쓰는 재최적화 경로에서도 새 노드가 제자리에서 시작한다.
+	const Transform t = anchorOpt->second.inverse() * pose;
+	const Transform rawPose = neighbor->getPose() * t;
+	Signature * s = this->createSignature(data, rawPose, 0);
 	_idMapCount = mapIdBackup;
 	if(s == 0)
 	{
@@ -6853,17 +6880,20 @@ int Memory::ingestNode(
 		return 0;
 	}
 
+	// HERoEHS lifelong: 격리로 태어난다 — 보호관찰(독립 검증)을 통과해 setQuarantined(false) 될 때까지
+	// LC·근접 후보가 아니다. 안 그러면 검증 전 노드에 곧바로 위치추정해 그 pose 로 자기를 채점한다.
+	s->setWeight(kQuarantinedWeight);
+
 	// 그래프 편입: STM 우회, WM 직접 삽입
 	_signatures.insert(std::make_pair(s->id(), s));
 	_workingMem.insert(std::make_pair(s->id(), UTimer::now()));
 
-	// 이웃 링크 (양방향, T_from_to 규약): T = neighbor.pose^-1 * new.pose
-	Transform t = neighbor->getPose().inverse() * pose;
+	// 이웃 링크 (양방향, T_from_to 규약): T = neighbor.mapPose^-1 * new.mapPose (위에서 계산)
 	cv::Mat infMatrix = covariance.inv();
 	neighbor->addLink(Link(linkToId, s->id(), Link::kNeighbor, t, infMatrix));
 	s->addLink(Link(s->id(), linkToId, Link::kNeighbor, t.inverse(), infMatrix));
 	// HERoEHS lifelong: 2번째 이웃 링크 — 위 강성 요구의 실제 결선 (같은 pose 규약)
-	Transform t2 = neighbor2->getPose().inverse() * pose;
+	Transform t2 = neighbor2Opt.inverse() * pose;
 	neighbor2->addLink(Link(neighbor2->id(), s->id(), Link::kNeighbor, t2, infMatrix));
 	s->addLink(Link(s->id(), neighbor2->id(), Link::kNeighbor, t2.inverse(), infMatrix));
 
@@ -6882,6 +6912,147 @@ int Memory::ingestNode(
 			s->id(), s->mapId(), linkToId, neighbor2->id(), bestDist2,
 			(int)uUniqueKeys(s->getWords()).size());
 	return s->id();
+}
+
+// HERoEHS lifelong: DB 에만 있는 노드(LTM·휴지통)의 존재와 weight
+static bool dbNodeWeight(DBDriver * db, int id, int & weight)
+{
+	Transform pose, gt;
+	int mapId = 0;
+	std::string label;
+	double stamp = 0.0;
+	std::vector<float> velocity;
+	GPS gps;
+	EnvSensors sensors;
+	return db->getNodeInfo(id, pose, mapId, weight, label, stamp, gt, velocity, gps, sensors);
+}
+
+bool Memory::setQuarantined(int id, bool quarantined)
+{
+	// HERoEHS lifelong: 격리(-2) ↔ 보통(≥0). -1(intermediate)·-9(무효)는 건드리지 않는다.
+	const int from = quarantined ? 0 : kQuarantinedWeight;   // 0 = "≥0" 조건 (DBDriver::updateNodeWeight)
+	const int to = quarantined ? kQuarantinedWeight : 0;
+	Signature * s = _getSignature(id);
+	if(s)
+	{
+		if(quarantined ? s->getWeight() >= 0 : s->getWeight() == kQuarantinedWeight)
+		{
+			s->setWeight(to);
+			_memoryChanged = true;
+		}
+		else if(s->getWeight() != to)
+		{
+			UWARN("setQuarantined(%d, %d): weight %d is neither quarantined nor normal — unchanged",
+					id, quarantined?1:0, s->getWeight());
+			return true;
+		}
+		// WM 노드도 바로 기록 — 비정상 종료에도 격리 상태가 DB 와 어긋나지 않게 (메모리 DB 는 닫을 때 통째로 저장된다)
+		if(_dbDriver && !_dbDriver->isInMemory())
+		{
+			_dbDriver->updateNodeWeight(id, from, to);
+		}
+	}
+	else
+	{
+		// LTM 노드 — DB 가 유일한 사본이라 메모리 DB 여도 바로 고친다
+		int weight = 0;
+		if(_dbDriver == 0 || !dbNodeWeight(_dbDriver, id, weight))
+		{
+			return false;
+		}
+		_dbDriver->updateNodeWeight(id, from, to);
+	}
+	UINFO("setQuarantined: node %d %s", id, quarantined?"quarantined":"released");
+	return true;
+}
+
+bool Memory::deleteNode(int id)
+{
+	// HERoEHS lifelong: 헤더 주석 참조. 메모리 → DB 순서.
+	if(id <= 0 || isInSTM(id))
+	{
+		UWARN("deleteNode: %d refused (%s)", id, id<=0?"invalid id":"in STM");
+		return false;
+	}
+	Signature * s = _getSignature(id);
+	int weight = 0;
+	if(s)
+	{
+		weight = s->getWeight();
+	}
+	else if(_dbDriver == 0 || !dbNodeWeight(_dbDriver, id, weight))
+	{
+		return false;   // 없는 노드
+	}
+	if(weight != kQuarantinedWeight)
+	{
+		// 격리 노드만 — 오케스트레이터가 틀린 id(다른 작업본의 사이드카 등)를 들고 와도 정규 맵 노드는 못 지운다
+		UWARN("deleteNode: %d refused (weight %d, only quarantined nodes can be deleted)", id, weight);
+		return false;
+	}
+
+	// 메모리의 모든 노드에서 이 노드로 가는 링크를 끊는다. 노드가 LTM 에 있어도 WM 의 앵커는 링크를 쥐고 있다가
+	// (삽입 → WM→LTM 이관 → 삭제) 저장 때 Link 행으로 되살린다 — 이웃 목록이 아니라 메모리 전체를 훑는다.
+	// removeLink 는 _linksModified 를 켜서 저장 때 그 노드의 Link 행이 다시 쓰인다.
+	for(std::map<int, Signature*>::iterator iter=_signatures.begin(); iter!=_signatures.end(); ++iter)
+	{
+		if(iter->first != id && iter->second->hasLink(id))
+		{
+			iter->second->removeLink(id);
+		}
+	}
+	if(s)
+	{
+		// 랜드마크 색인 정리 (moveToTrash 와 같은 절차)
+		for(std::map<int, Link>::const_iterator iter=s->getLandmarks().begin(); iter!=s->getLandmarks().end(); ++iter)
+		{
+			std::map<int, std::set<int> >::iterator nter = _landmarksIndex.find(iter->first);
+			if(nter!=_landmarksIndex.end())
+			{
+				nter->second.erase(id);
+				if(nter->second.empty())
+				{
+					_landmarksIndex.erase(nter);
+				}
+			}
+		}
+		s->removeLinks(false);
+		s->removeLandmarks();
+
+		// 사전 참조만 푼다. 이 노드만 쓰던 단어는 다음 preUpdate 의 cleanUnusedWords 가 저장한 뒤 정리한다 —
+		// 여기서 바로 지우면 아직 저장 안 된 단어를 LTM 의 다른 노드가 참조하고 있을 때 잃는다.
+		this->disableWordsRef(id);
+
+		_workingMem.erase(id);
+		_signatures.erase(id);
+		_groundTruths.erase(id);
+		if(_lastSignature == s)
+		{
+			_lastSignature = 0;
+			if(_stMem.size())
+			{
+				_lastSignature = this->_getSignature(*_stMem.rbegin());
+			}
+			else if(_workingMem.size())
+			{
+				_lastSignature = this->_getSignature(_workingMem.rbegin()->first);
+			}
+		}
+		if(_lastGlobalLoopClosureId == id)
+		{
+			_lastGlobalLoopClosureId = 0;
+		}
+		delete s;
+	}
+	_labels.erase(id);   // 라벨 색인(WM·LTM 전 노드) — 남으면 list_labels·set_goal(label) 이 지워진 id 로 간다
+	if(_dbDriver)
+	{
+		_dbDriver->deleteNode(id);
+	}
+	_memoryChanged = true;
+	_linksChanged = true;
+	UINFO("deleteNode: node %d deleted", id);
+	return true;
 }
 
 std::set<int> Memory::selectRemovableWords(
