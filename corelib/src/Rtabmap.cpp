@@ -362,6 +362,7 @@ void Rtabmap::init(const ParametersMap & parameters, const std::string & databas
 	}
 
 	_optimizedPoses.clear();
+	_optimizedPosesStash.clear();
 	_constraints.clear();
 	_globalScanMap.clear();
 	_globalScanMapPoses.clear();
@@ -524,13 +525,14 @@ void Rtabmap::close(bool databaseSaved, const std::string & ouputDatabasePath)
 					_optimizedPoses.erase(iter->first);
 				}
 			}
-			_memory->saveOptimizedPoses(_optimizedPoses, _lastLocalizationPose);
+			_memory->saveOptimizedPoses(optimizedPosesToSave(), _lastLocalizationPose);
 		}
 		_memory->close(databaseSaved, true, ouputDatabasePath);
 		delete _memory;
 		_memory = 0;
 	}
 	_optimizedPoses.clear();
+	_optimizedPosesStash.clear();
 	_lastLocalizationPose.setNull();
 
 	if(_bayesFilter)
@@ -745,7 +747,7 @@ void Rtabmap::parseParameters(const ParametersMap & parameters)
 			}
 
 			// In both cases, we save the latest optimized graph and latest localization pose
-			_memory->saveOptimizedPoses(_optimizedPoses, _lastLocalizationPose);
+			_memory->saveOptimizedPoses(optimizedPosesToSave(), _lastLocalizationPose);
 		}
 
 		_memory->parseParameters(parameters);
@@ -935,6 +937,7 @@ int Rtabmap::triggerNewMap()
 		mapId = _memory->incrementMapId(&reducedIds);
 		UINFO("New map triggered, new map = %d", mapId);
 		_optimizedPoses.clear();
+		_optimizedPosesStash.clear();
 		_constraints.clear();
 
 		if(_bayesFilter)
@@ -1094,6 +1097,7 @@ void Rtabmap::resetMemory()
 	_lastProcessTime = 0.0;
 	_someNodesHaveBeenTransferred = false;
 	_optimizedPoses.clear();
+	_optimizedPosesStash.clear();
 	_constraints.clear();
 	_mapCorrection.setIdentity();
 	_mapCorrectionBackup.setNull();
@@ -3873,8 +3877,7 @@ bool Rtabmap::process(
 				lastProximitySpaceClosureId = 0;
 				rejectedLoopClosure = true;
 			}
-			else if(_memory->isIncremental() &&
-			  loopClosureLinksAdded.size() &&
+			else if(loopClosureLinksAdded.size() && // HERoEHS lifelong: upstream 은 매핑 모드만 — 위치추정에서도 검사 (맵이 고정돼 틀린 LC 는 자기 링크에 오차가 모인다)
 			  optimizationIterations > 0 &&
 			  constraints.size())
 			{
@@ -3988,6 +3991,7 @@ bool Rtabmap::process(
 			if(updateConstraints)
 			{
 				UINFO("Updated local map (old size=%d, new size=%d)", (int)_optimizedPoses.size(), (int)poses.size());
+				stashOptimizedPosesNotIn(poses);
 				_optimizedPoses = poses;
 				_constraints = constraints;
 				_localizationCovariance = covariance;
@@ -4524,6 +4528,7 @@ bool Rtabmap::process(
 					{
 						UDEBUG("Removed %d from local map", iter->first);
 						UASSERT(iter->first != _lastLocalizationNodeId);
+						stashOptimizedPose(iter->first, iter->second); // 종료 저장에 남기기 위해 보관 (맵 노드만)
 						_optimizedPoses.erase(iter++);
 
 						if(!_globalScanMap.empty())
@@ -4555,6 +4560,9 @@ bool Rtabmap::process(
 		{
 			if(!_optimizedPoses.empty())
 				UDEBUG("Optimized poses cleared!");
+			// HERoEHS lifelong: 위치추정 모드에서 마지막 위치추정 노드를 잃으면 upstream 은 로컬 맵을 비우고 다음 LC 때 guess 없이
+			// 처음부터 다시 푼다(= 뿌리 raw pose 로 맵 이동). 비우기 전에 보관본에 넣어 다음 재최적화가 저장 pose 로 고정되게 한다.
+			stashOptimizedPosesNotIn(std::map<int, Transform>());
 			_optimizedPoses.clear();
 			_constraints.clear();
 		}
@@ -5250,6 +5258,20 @@ void Rtabmap::optimizeCurrentMap(
 		if(!_optimizeFromGraphEnd && ids.size() > 1)
 		{
 			id = ids.begin()->first;
+			// HERoEHS lifelong: 위치추정 모드에선 저장 pose(guess)가 있는 가장 작은 id 를 뿌리로 — 뿌리는 optimizeGraph 에서
+			// guess 로 고정되어 맵 프레임을 못 박는다. 저장 pose 없는 노드(막 retrieval 된 것)가 뿌리면 raw pose 로 프레임이 튄다.
+			if(!_memory->isIncremental() && (!optimizedPoses.empty() || !_optimizedPosesStash.empty()))
+			{
+				for(std::map<int, int>::const_iterator iter=ids.begin(); iter!=ids.end(); ++iter)
+				{
+					if(iter->first > 0 && !_memory->isInSTM(iter->first) &&
+					   (uContains(optimizedPoses, iter->first) || uContains(_optimizedPosesStash, iter->first)))
+					{
+						id = iter->first;
+						break;
+					}
+				}
+			}
 		}
 		UINFO("get %d ids time %f s", (int)ids.size(), timer.ticks());
 
@@ -5310,17 +5332,59 @@ std::map<int, Transform> Rtabmap::optimizeGraph(
 		}
 	}
 
+	// HERoEHS lifelong (2026-10-02): 위치추정 모드에선 저장된 최적화 pose(guess)가 맵 프레임의 기준이다 — 맵을 고정한다.
+	// upstream 은 뿌리 노드엔 guess 를 안 쓰고(raw odom pose 고정) 맵 노드에 prior 도 안 건다. WM 상한(Rtabmap/MemoryThr)으로
+	// 노드 1 이 LTM 에 가면 뿌리가 중간 노드가 되어 맵 전체가 그 노드의 raw−최적화 차만큼 통째로 이동하고(실기 changbo_0928:
+	// 삽입 0건에 338 노드 전부 0.11~0.44 m), retrieval 때마다 부분 그래프의 다른 최적해로 휜다(changbo01: 2.3°). 결과가
+	// _optimizedPoses 에 덮어써지고 종료 시 저장돼 세션마다 누적됐다. 여기선 뿌리에도 guess 를 쓰고, 저장 pose 가 있는 맵 노드
+	// (STM 제외)를 전부 prior 로 고정한다 — retrieval 된 노드와 새 노드만 링크로 자리를 잡고, 맵은 움직이지 않는다.
+	const bool freezeMap = !_memory->isIncremental() && (!guessPoses.empty() || !_optimizedPosesStash.empty());
+	std::map<int, Transform> guess = guessPoses;
+	if(freezeMap)
+	{
+		// WM 을 떠났다가 retrieval 된 노드는 _optimizedPoses(guess)에 없다 — 보관본의 저장 pose 로 되돌려 같이 고정한다.
+		// 링크로 되살리면 이웃 링크의 루프클로저 잔차만큼 어긋나고, 들락날락할 때마다 그 자리가 다시 기준이 되어 맵 형상이
+		// raw odom 형상으로 수렴했다(합성 시험에서 40 프레임 만에 0.2 m). 보관본에도 없는 노드(새 노드)만 링크로 자리 잡는다.
+		for(std::map<int, Transform>::const_iterator iter=_optimizedPosesStash.begin(); iter!=_optimizedPosesStash.end(); ++iter)
+		{
+			if(uContains(poses, iter->first) && !uContains(guess, iter->first))
+			{
+				guess.insert(*iter);
+			}
+		}
+	}
 	if(_graphOptimizer->iterations() > 0)
 	{
 		for(std::map<int, Transform>::iterator iter=poses.begin(); iter!=poses.end(); ++iter)
 		{
-			// Apply guess poses (if some), ignore for rootid to avoid origin drifting
-			std::map<int, Transform>::const_iterator foundGuess = guessPoses.find(iter->first);
-			if(foundGuess!=guessPoses.end() && iter->first != fromId)
+			// Apply guess poses (if some), ignore for rootid to avoid origin drifting (mapping only)
+			std::map<int, Transform>::const_iterator foundGuess = guess.find(iter->first);
+			if(foundGuess!=guess.end() && (iter->first != fromId || freezeMap))
 			{
 				iter->second = foundGuess->second;
 			}
 		}
+		if(freezeMap)
+		{
+			// 분산 1e-6 (σ 1 mm): 링크(σ 2~4 cm)보다 수백 배 뻣뻣해 맵 노드는 제자리. RGBD/LocalizationPriorError(σ 3 cm)는
+			// odom 캐시 검증용으로 그대로 둔다 — 그 값으로 고정하면 LC 하나에 수 cm 씩 밀려 세션마다 누적된다.
+			cv::Mat priorInfMat = cv::Mat::eye(6, 6, CV_64FC1) * 1e6;
+			int frozen = 0;
+			for(std::map<int, Transform>::iterator iter=poses.begin(); iter!=poses.end(); ++iter)
+			{
+				if(iter->first > 0 && uContains(guess, iter->first) && !_memory->isInSTM(iter->first))
+				{
+					edgeConstraints.insert(std::make_pair(iter->first, Link(iter->first, iter->first, Link::kPosePrior, iter->second, priorInfMat)));
+					++frozen;
+				}
+			}
+			UINFO("Localization: %d map poses frozen with priors (root %d), %d poses free", frozen, fromId, (int)poses.size()-frozen);
+		}
+	}
+	const bool priorsIgnoredBackup = _graphOptimizer->priorsIgnored();
+	if(freezeMap)
+	{
+		_graphOptimizer->setPriorsIgnored(false); // 위 고정 prior 를 쓰기 위해 — 아래서 복원
 	}
 
 
@@ -5337,7 +5401,7 @@ std::map<int, Transform> Rtabmap::optimizeGraph(
 	else
 	{
 		bool hasLandmarks = !edgeConstraints.empty() && edgeConstraints.begin()->first < 0;
-		if(poses.size() != guessPoses.size() || hasLandmarks)
+		if(poses.size() != guess.size() || hasLandmarks)
 		{
 			UDEBUG("recompute poses using only links (robust to multi-session)");
 			std::map<int, Transform> posesOut;
@@ -5362,8 +5426,12 @@ std::map<int, Transform> Rtabmap::optimizeGraph(
 		if(!poses.empty() && optimizedPoses.empty())
 		{
 			UWARN("Optimization has failed (poses=%d, guess=%d, links=%d)...",
-				  (int)poses.size(), (int)guessPoses.size(), (int)edgeConstraints.size());
+				  (int)poses.size(), (int)guess.size(), (int)edgeConstraints.size());
 		}
+	}
+	if(freezeMap)
+	{
+		_graphOptimizer->setPriorsIgnored(priorsIgnoredBackup);
 	}
 
 	UINFO("Optimization time %f s", timer.ticks());
@@ -6736,6 +6804,7 @@ std::vector<int> Rtabmap::deleteNodes(const std::vector<int> & ids)
 		deleted.push_back(id);
 		// 이 객체가 들고 있는 그래프 캐시에서도 지운다 — 남으면 다음 최적화·발행이 없는 노드를 가리킨다
 		_optimizedPoses.erase(id);
+		_optimizedPosesStash.erase(id);
 		for(std::multimap<int, Link>::iterator iter=_constraints.begin(); iter!=_constraints.end();)
 		{
 			if(iter->second.from() == id || iter->second.to() == id)
@@ -6791,6 +6860,58 @@ std::vector<int> Rtabmap::deleteNodes(const std::vector<int> & ids)
 		}
 	}
 	return deleted;
+}
+
+void Rtabmap::stashOptimizedPose(int id, const Transform & pose)
+{
+	if(_memory == 0 || _memory->isIncremental() || id <= 0 || pose.isNull())
+	{
+		return;
+	}
+	// 위치추정 프레임의 임시 STM 노드는 저장되지 않고 버려진다 — 보관하면 저장 id 가 부풀어 다음 로드가 전부 폐기된다
+	// (Memory::loadOptimizedPoses 는 저장 id 가 WM 에 없으면 비운다). DB(휴지통 포함)에 있는 노드만.
+	Transform odomPose, gt;
+	int mapId = 0, weight = 0;
+	std::string label;
+	double stamp = 0.0;
+	std::vector<float> velocity;
+	GPS gps;
+	EnvSensors sensors;
+	if(_memory->getNodeInfo(id, odomPose, mapId, weight, label, stamp, gt, velocity, gps, sensors, true))
+	{
+		_optimizedPosesStash[id] = pose;
+	}
+}
+
+void Rtabmap::stashOptimizedPosesNotIn(const std::map<int, Transform> & keep)
+{
+	if(_memory == 0 || _memory->isIncremental())
+	{
+		return;
+	}
+	for(std::map<int, Transform>::const_iterator iter=_optimizedPoses.begin(); iter!=_optimizedPoses.end(); ++iter)
+	{
+		if(keep.find(iter->first) == keep.end())
+		{
+			stashOptimizedPose(iter->first, iter->second);
+		}
+	}
+}
+
+std::map<int, Transform> Rtabmap::optimizedPosesToSave() const
+{
+	if(_memory == 0 || _memory->isIncremental() || _optimizedPosesStash.empty())
+	{
+		return _optimizedPoses;
+	}
+	std::map<int, Transform> poses = _optimizedPosesStash;
+	for(std::map<int, Transform>::const_iterator iter=_optimizedPoses.begin(); iter!=_optimizedPoses.end(); ++iter)
+	{
+		poses[iter->first] = iter->second;   // 현재 값 우선
+	}
+	UINFO("Saving %d optimized poses (%d in local map, %d kept from nodes transferred to LTM)",
+			(int)poses.size(), (int)_optimizedPoses.size(), (int)(poses.size()-_optimizedPoses.size()));
+	return poses;
 }
 
 void Rtabmap::clearPath(int status)

@@ -14,6 +14,7 @@
  *            · DB 재로드 뒤 위치추정 정상
  *   T2 (LTM) WM 상한으로 LTM 에 내려간 격리 노드의 해제·재격리(DB 직접) · 삭제(DB 행)
  *   T3       같은 세션 삽입 → LTM 이관 → 삭제 → 종료: WM 에 남은 앵커가 링크를 되살리지 않는다
+ *   T4       WM 상한 아래 retrieval 재최적화를 거쳐도 저장된 맵 pose 가 그대로다 (뿌리·prior 고정)
  *   (격리 아닌 노드는 삭제 거부 — T1)
  */
 #include <rtabmap/core/Rtabmap.h>
@@ -21,6 +22,7 @@
 #include <rtabmap/core/Signature.h>
 #include <rtabmap/core/Statistics.h>
 #include <rtabmap/core/CameraModel.h>
+#include <rtabmap/core/Compression.h>
 #include <rtabmap/utilite/ULogger.h>
 #include <rtabmap/utilite/UFile.h>
 #include <rtabmap/utilite/UStl.h>
@@ -107,6 +109,30 @@ ParametersMap baseParams()
 	return p;
 }
 
+// Admin 에 저장된 최적화 pose (opt_ids/opt_poses: zlib 본문 + 끝 12 바이트 헤더 = rtabmap compressData2)
+static std::map<int, Transform> dbSavedPoses(const std::string & db)
+{
+	std::map<int, Transform> out;
+	sqlite3 * h = 0;
+	if(sqlite3_open_v2(db.c_str(), &h, SQLITE_OPEN_READONLY, 0) != SQLITE_OK) return out;
+	sqlite3_busy_timeout(h, 5000);
+	sqlite3_stmt * st = 0;
+	if(sqlite3_prepare_v2(h, "SELECT opt_ids, opt_poses FROM Admin", -1, &st, 0) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW &&
+	   sqlite3_column_type(st, 0) != SQLITE_NULL)
+	{
+		cv::Mat ids = uncompressData((const unsigned char*)sqlite3_column_blob(st, 0), sqlite3_column_bytes(st, 0));
+		cv::Mat poses = uncompressData((const unsigned char*)sqlite3_column_blob(st, 1), sqlite3_column_bytes(st, 1));
+		for(int i=0; i<ids.cols && (i+1)*12 <= poses.cols; ++i)   // poses 는 1 x (N*12) 평면 배열 (DBDriverSqlite3::loadOptimizedPosesQuery 와 같게)
+		{
+			const float * p = poses.ptr<float>(0) + i*12;
+			out.insert(std::make_pair(ids.at<int>(i), Transform(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11])));
+		}
+	}
+	if(st) sqlite3_finalize(st);
+	sqlite3_close(h);
+	return out;
+}
+
 // DB 직접 조회 (rtabmap 이 연 상태에서도 읽기 가능)
 static long long dbCount(const std::string & db, const std::string & sql)
 {
@@ -181,7 +207,7 @@ int main(int argc, char ** argv)
 {
 	setvbuf(stdout, 0, _IONBF, 0);   // 중단돼도 진행 로그가 남게
 	ULogger::setType(ULogger::kTypeConsole);
-	ULogger::setLevel(ULogger::kWarning);
+	ULogger::setLevel(getenv("LIFELONG_SELFTEST_LOGINFO") ? ULogger::kInfo : ULogger::kWarning);   // 코어 경로 추적용
 	const std::string dir = argc > 1 ? argv[1] : ".";
 	const std::string db = dir + "/lifelong_selftest.db";
 	UFile::erase(db);
@@ -404,7 +430,7 @@ int main(int argc, char ** argv)
 	{
 		Rtabmap r;
 		ParametersMap p = locParams();
-		p[Parameters::kRtabmapMemoryThr()] = "5";
+		p[Parameters::kRtabmapMemoryThr()] = "11";   // 맵 노드 수 — 삽입 1개만 넘친다
 		p[Parameters::kMemRecentWmRatio()] = "0";
 		p[Parameters::kBayesPredictionLC()] = "0.1 0.36 0.30";
 		r.init(p, db);
@@ -422,12 +448,11 @@ int main(int argc, char ** argv)
 			for(std::multimap<int, Link>::const_iterator iter=r.getMemory()->getSignature(N3)->getLinks().begin(); iter!=r.getMemory()->getSignature(N3)->getLinks().end(); ++iter) printf(" %d", iter->first);
 			printf("\n");
 		}
-		// 앵커(2·3) 근처에서 몇 프레임 더 — 근접 노드 나이 갱신(updateAge)으로 앵커가 WM 에 늦게까지 남는다.
-		// 실제 맵(WM 수백 노드)에선 격리 노드(weight -2)가 먼저 이관되고 앵커는 WM 에 남는 게 보통이다.
-		localize(r, tex, 0.35, 0.15f, 3, seq);
-		for(int i=0; i<30 && N3 > 0 && r.getMemory()->getSignature(N3); ++i)
+		// 노드 5(y=0.8) 근처에 머문다: 전역 면제는 가설 주변 2홉(Bayes 예측 벡터 3) — 앵커 3 은 2홉이라 WM 에 남고,
+		// N3 은 3홉이라 가장 낮은 weight(-2)로 먼저 LTM 에 간다. 실제 맵(WM 수백 노드)에서도 격리 노드가 먼저 이관된다.
+		for(int i=0; i<40 && N3 > 0 && r.getMemory()->getSignature(N3); ++i)
 		{
-			localize(r, tex, 1.6 + 0.01 * (i % 20), 1.5f + 0.01f * i, 1, seq);
+			localize(r, tex, 0.8 + 0.01 * (i % 5), 0.7f + 0.01f * (i % 5), 1, seq);
 		}
 		CHECK(N3 > 0 && r.getMemory()->getSignature(N3) == 0, "moved to LTM in the same session");
 		std::vector<int> holders;   // WM 에서 N3 로 가는 링크를 쥔 노드 — 있어야 이 시험이 의미 있다
@@ -461,9 +486,67 @@ int main(int argc, char ** argv)
 		snprintf(q, sizeof(q), "SELECT COUNT(*) FROM Feature WHERE word_id>0 AND word_id NOT IN (SELECT id FROM Word)");
 		CHECK(dbCount(db, q) == 0, "every stored feature's word is in the Word table (%lld missing)", dbCount(db, q));
 	}
+	// ---------- T4: 위치추정 재최적화는 맵을 움직이지 않는다 ----------
+	// WM 상한으로 노드 1 이 LTM 에 가면 upstream 은 뿌리를 WM 최소 id 로 바꾸고 그 raw pose 에 고정해 맵 전체가 raw−최적화 차만큼
+	// 통째로 이동했다(실기 changbo_0928: 338 노드 전부 0.11~0.44 m). 고정(prior) 수정 뒤엔 저장 pose 가 그대로여야 한다.
+	printf("[T4] localization re-optimization (retrieval under WM limit) must not move the map\n");
 	{
 		Rtabmap r;
+		ParametersMap p = locParams();
+		p[Parameters::kRtabmapMemoryThr()] = "5";
+		p[Parameters::kMemRecentWmRatio()] = "0";
+		p[Parameters::kBayesPredictionLC()] = "0.1 0.36 0.30";
+		r.init(p, db);
+		int seq = 600;
+		std::vector<int> loc = localize(r, tex, 0.2, 0.0f, 4, seq);
+		CHECK(!loc.empty(), "localized near the origin");
+		int retrieved = 0, accepted = 0;
+		for(int i=0; i<40; ++i)
+		{
+			// 멀리(y≈1.6~1.8) 머물러 노드 1~5 가 LTM 으로 가고, 중간(노드 6, y≈1.0)으로 돌아와 retrieval → "Update map correction"
+			// 재최적화. 노드 1~3 은 2홉 면제 밖이라 LTM 에 남은 채 세션이 끝난다 = 실기(뿌리가 중간 노드인 채 저장)와 같은 조건.
+			// (원점까지 돌아오면 마지막 재최적화 뿌리가 노드 1 이 되어 옛 코드도 제자리로 돌아와 이 시험이 공허해진다)
+			double y = i < 25 ? 1.6 + 0.01 * (i % 20) : 1.0 + 0.01 * ((i - 25) % 5);
+			accepted += (int)localize(r, tex, y, (float)y - 0.1f, 1, seq).size();
+			retrieved += (int)uValue(r.getStatistics().data(), std::string("Memory/Signatures_retrieved/"), 0.0f);
+		}
+		CHECK(retrieved > 0, "nodes were retrieved from LTM (%d) — re-optimization path exercised", retrieved);
+		CHECK(accepted > 0, "localization still accepted with the map frozen (%d)", accepted);
+		r.close(true);
+	}
+	{
+		// 저장값(Admin)을 직접 읽는다 — getGraph 는 저장 id 가 WM 에 없으면 로드를 버리고 새로 재최적화해 저장값을 못 본다
+		std::map<int, Transform> saved = dbSavedPoses(db);
+		int junk = 0;
+		for(std::map<int, Transform>::const_iterator iter=saved.begin(); iter!=saved.end(); ++iter)
+		{
+			char qq[128];
+			snprintf(qq, sizeof(qq), "SELECT COUNT(*) FROM Node WHERE id=%d", iter->first);
+			if(iter->first > 0 && dbCount(db, qq) == 0) ++junk;
+		}
+		CHECK(junk == 0, "saved poses only for nodes that exist (%d junk ids of %zu — localization STM frames must not be saved)", junk, saved.size());
+		double maxShift = 0.0, maxYaw = 0.0;
+		int n = 0;
+		for(std::map<int, Transform>::const_iterator iter=opt.begin(); iter!=opt.end(); ++iter)
+		{
+			if(iter->first <= 0 || !saved.count(iter->first)) continue;
+			++n;
+			maxShift = std::max(maxShift, dist(iter->second, saved.at(iter->first)));
+			maxYaw = std::max(maxYaw, (double)fabs(iter->second.theta() - saved.at(iter->first).theta()));
+		}
+		CHECK(n == (int)opt.size(), "all %zu original map poses still saved (%d)", opt.size(), n);
+		CHECK(maxShift < 1e-3 && maxYaw < 1e-3, "saved map poses unchanged after all localization sessions (max %.4f m, %.4f rad)", maxShift, maxYaw);
+		Rtabmap r;
 		r.init(locParams(), db);
+		std::map<int, Transform> optNow;
+		std::multimap<int, Link> links;
+		r.getGraph(optNow, links, true, false);
+		double maxLoad = 0.0;
+		for(std::map<int, Transform>::const_iterator iter=saved.begin(); iter!=saved.end(); ++iter)
+		{
+			if(iter->first > 0 && optNow.count(iter->first)) maxLoad = std::max(maxLoad, dist(iter->second, optNow.at(iter->first)));
+		}
+		CHECK(optNow.size() >= saved.size() && maxLoad < 1e-3, "next session loads the saved poses as-is (%zu loaded, max diff %.4f m)", optNow.size(), maxLoad);
 		int seq = 400;
 		std::vector<int> loc = localize(r, tex, 1.4, 0.0f, 6, seq);
 		CHECK(!loc.empty(), "final reload localizes (%zu accepted)", loc.size());

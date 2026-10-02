@@ -164,6 +164,12 @@ public:
 	int setNodesQuarantined(const std::vector<int> & ids, bool quarantined);
 	// HERoEHS lifelong: 노드 영구 삭제 (Memory::deleteNode) + 이 객체의 그래프 캐시 정리. 반환: 삭제된 id.
 	std::vector<int> deleteNodes(const std::vector<int> & ids);
+	// HERoEHS lifelong: 위치추정 모드에서 _optimizedPoses 가 keep 으로 줄어들 때 빠지는 노드 pose 를 보관 (저장 시 합침).
+	void stashOptimizedPosesNotIn(const std::map<int, Transform> & keep);
+	// HERoEHS lifelong: id 가 DB 에 있는 맵 노드면(위치추정 프레임의 임시 STM 노드가 아니면) pose 를 보관본에 넣는다.
+	void stashOptimizedPose(int id, const Transform & pose);
+	// HERoEHS lifelong: 종료 저장용 — 위치추정 모드면 보관본 ∪ 현재(현재 우선), 매핑 모드면 현재 그대로.
+	std::map<int, Transform> optimizedPosesToSave() const;
 	Transform getPose(int locationId) const;
 	Transform getMapCorrection() const {return _mapCorrection;}
 	const Memory * getMemory() const {return _memory;}
@@ -388,6 +394,10 @@ private:
 	std::string _wDir;
 
 	std::map<int, Transform> _optimizedPoses;
+	// HERoEHS lifelong: 위치추정 모드에서 WM 을 떠나 _optimizedPoses 에서 빠진 노드의 마지막 최적화 pose. upstream 은 종료 때
+	// _optimizedPoses(WM 노드만)를 저장해 WM 상한 아래선 맵 일부만 남고(실기 651 중 338), 다음 세션이 나머지를 링크로 되살리며
+	// 루프클로저 잔차만큼 어긋났다. 저장 시 이 보관본과 합쳐 전 노드 pose 를 보존한다 (stashOptimizedPosesNotIn).
+	std::map<int, Transform> _optimizedPosesStash;
 	std::multimap<int, Link> _constraints;
 	Transform _mapCorrection;
 	Transform _mapCorrectionBackup; // used in localization mode when odom is lost
