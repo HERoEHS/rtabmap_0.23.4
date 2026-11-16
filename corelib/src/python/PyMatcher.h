@@ -2,6 +2,7 @@
  * Python interface for python matchers like:
  *  - SuperGlue: https://github.com/magicleap/SuperGluePretrainedNetwork
  *  - OANET https://github.com/zjhthu/OANet
+ *  - LightGlue: https://github.com/cvg/LightGlue
  */
 
 #ifndef PYMATCHER_H
@@ -31,6 +32,9 @@ public:
   int iterations() const {return iterations_;}
   bool cuda() const {return cuda_;}
   const std::string & model() const {return model_;}
+  // True if the script declares MULTI_CAMERA = True: it accepts keypoints of several cameras stitched
+  // side by side (x >= imageSize.width selects the camera), imageSize being the size of ONE camera image.
+  bool multiCamera() const {return multiCamera_;}
 
   std::vector<cv::DMatch> match(
 		  const cv::Mat & descriptorsQuery,
@@ -47,6 +51,7 @@ private:
   int iterations_;
   bool cuda_;
   std::string model_;
+  bool multiCamera_;
 };
 
 }
