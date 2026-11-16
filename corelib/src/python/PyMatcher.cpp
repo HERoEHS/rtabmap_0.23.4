@@ -28,7 +28,8 @@ PyMatcher::PyMatcher(
 				pFunc_(0),
 				matchThreshold_(matchThreshold),
 				iterations_(iterations),
-				cuda_(cuda)
+				cuda_(cuda),
+				multiCamera_(false)
 {
 	path_ = uReplaceChar(pythonMatcherPath, '~', UDirectory::homeDir());
 	model_ = uReplaceChar(model, '~', UDirectory::homeDir());
@@ -62,6 +63,24 @@ PyMatcher::PyMatcher(
 	{
 		UERROR("Module \"%s\" could not be imported! (File=\"%s\")", scriptName.c_str(), path_.c_str());
 		UERROR("%s", getPythonTraceback().c_str());
+	}
+	else
+	{
+		PyObject * pMultiCamera = PyObject_GetAttrString(pModule_, "MULTI_CAMERA");
+		if(pMultiCamera)
+		{
+			int isTrue = PyObject_IsTrue(pMultiCamera);
+			if(isTrue < 0)
+			{
+				PyErr_Clear();
+			}
+			multiCamera_ = isTrue == 1;
+			Py_DECREF(pMultiCamera);
+		}
+		else
+		{
+			PyErr_Clear(); // attribute not declared: single camera script
+		}
 	}
 }
 

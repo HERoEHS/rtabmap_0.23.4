@@ -1410,7 +1410,7 @@ Transform RegistrationVis::computeTransformationImpl(
 								descriptorsTo.type() == CV_32F &&
 								descriptorsFrom.type() == CV_32F &&
 								descriptorsFrom.rows == (int)kptsFrom.size() &&
-								models.size() == 1)
+								(models.size() == 1 || (models.size() > 1 && _pyMatcher->multiCamera())))
 							{
 								UDEBUG("Python matching");
 								matches = _pyMatcher->match(descriptorsTo, descriptorsFrom, kptsTo, kptsFrom, models[0].imageSize());
@@ -1419,7 +1419,7 @@ Transform RegistrationVis::computeTransformationImpl(
 							{
 								if(_nnType == 6 && _pyMatcher)
 								{
-									UDEBUG("Invalid inputs for Python matching (desc type=%d, only float descriptors supported, multicam not supported), doing bruteforce matching instead.", descriptorsFrom.type());
+									UDEBUG("Invalid inputs for Python matching (desc type=%d, only float descriptors supported, multicam only with scripts declaring MULTI_CAMERA=True), doing bruteforce matching instead.", descriptorsFrom.type());
 								}
 #else
 							{
